@@ -11,14 +11,6 @@
 #  only creates shallow copies. These copies are partially composed of references back to the original
 #  object: thus if the original object is modified this can impact the shallow copy and vice versa
 #
-#  Want to see what I mean? Try this in your python shell:
-#
-#  orig = ['a','b','c']
-#  copy = orig
-#  new = [] + copy
-#  copy.pop(1)
-#  print(str(orig) + '     ' + str(copy) + '     ' + str(new))
-#
 ########################################################################################################
 
 from copy import deepcopy
