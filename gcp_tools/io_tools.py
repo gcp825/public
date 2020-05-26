@@ -1,13 +1,13 @@
 # Abstraction Layer for GCP functionality
-#   Provides a more user friendly implementation of GCP APIs/Libraries
 #   Obscures some of the stranger GCP implementation decisions
+#   Standardises approach to executing common functions
 
 from collections  import namedtuple
 from google.cloud import pubsub_v1, storage
 import os
 
 ################################################################
-# Storage: Download from Bucket
+# Storage: Download from Bucket add a comment
 ################################################################
 
 def create_storage_client():
@@ -127,7 +127,7 @@ def sync_pull(subscriber, subscription_path, limit=1000):
         
     if pull_flag is True:
         
-        Named_Tuple = namedtuple('ack_id','sub_msg')
+        Named_Tuple = namedtuple('sub_msg','ack_id msg')
     
         response = subscriber.pull(subscription_path, max_messages=msg_limit, timeout=30)
 
