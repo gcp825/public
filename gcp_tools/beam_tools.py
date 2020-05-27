@@ -11,6 +11,14 @@
 #  only creates shallow copies. These copies are partially composed of references back to the original
 #  object: thus if the original object is modified this can impact the shallow copy and vice versa
 #
+#  Want to see what I mean? Try this in your python shell:
+#
+#  orig = ['a','b','c']
+#  copy = orig
+#  new = [] + copy
+#  copy.pop(1)
+#  print(str(orig) + '     ' + str(copy) + '     ' + str(new))
+#
 ########################################################################################################
 
 from copy import deepcopy
@@ -43,7 +51,7 @@ class DropFields(beam.PTransform):
             arglist.sort(reverse=True)
             listout = deepcopy(listin)
         
-            for i in range(len(arglist)): listout.pop(arglist[i])
+            for i in arglist: listout.pop(i)
             
             yield listout
 
@@ -70,11 +78,12 @@ class KeepFields(beam.PTransform):
         def process(self, listin):
      
              listout = []
-             for i in range(len(self.args)):
-                 if str(self.args[i]) in ('x','X'):
+
+             for i in self.args:
+                 if str(i).lower() == 'x':
                      listout = listout + ['']
-                 else:                     
-                     listout = listout + [str(listin[self.args[i]])]                                  
+                 else:   
+                     listout = listout + [str(listin[i])]
 
              yield listout
 
@@ -99,11 +108,12 @@ class AppendFields(beam.PTransform):
         def process(self, listin):
      
              listout = deepcopy(listin)
-             for i in range(len(self.args)):
-                 if str(self.args[i]) in ('x','X'):
+
+             for i in self.args:
+                 if str(i).lower() == 'x':
                      listout = listout + ['']
                  else:                     
-                     listout = listout + [str(listin[self.args[i]])]                                  
+                     listout = listout + [str(listin[i])] 
 
              yield listout
 
@@ -134,22 +144,15 @@ class XForm(beam.PTransform):
             self.kwargs = kwargs
         
         def process(self, listin):
-     
-            keylist = list(self.kwargs.keys())
-            listout = deepcopy(listin)
-            transforms = {}
-         
-            for i in range(len(keylist)):
-                transforms.update({int(keylist[i][1:]) : self.kwargs[keylist[i]]})
-            keylist = list(transforms.keys())
-         
-            for i in range(len(keylist)):
-                func = transforms[keylist[i]]
-                oldval = listout[keylist[i]]
-                newval = func(oldval)
-                listout.pop(keylist[i])
-                listout.insert(keylist[i],newval)                             
 
+            keylist = list(self.kwargs.keys())
+            for i,key in enumerate(keylist): keylist[i] = int(key[1:])
+                
+            transforms = zip(keylist,list(self.kwargs.values()))
+            listout = deepcopy(listin)
+            
+            for i,func in transforms: listout[i] = func(listout[i])
+       
             yield listout 
 
 #######################################################################################################
@@ -179,20 +182,15 @@ class XFormAppend(beam.PTransform):
             self.kwargs = kwargs
         
         def process(self, listin):
-     
-            keylist = []
-            transforms = list(self.kwargs.values())
+
+            keylist = list(self.kwargs.keys())
+            for i,key in enumerate(keylist): keylist[i] = int(key[1:])
+                
+            transforms = zip(keylist,list(self.kwargs.values()))
             listout = deepcopy(listin)
-         
-            for k in list(self.kwargs.keys()):
-                keylist = keylist + [int(k[1:])]
-         
-            for i in range(len(keylist)):
-                func = transforms[i]
-                oldval = listout[keylist[i]]
-                newval = func(oldval)
-                listout.append(newval)
- 
+            
+            for i,func in transforms: listout.append(func(listout[i]))
+            
             yield listout 
  
 #######################################################################################################
@@ -235,28 +233,26 @@ class Sort(beam.PTransform):
 
         def process(self, listin):
  
-            arglist = list(self.args)
             listout = deepcopy(listin)
-            
-            for i in range(len(arglist)):
-                
-                if type(arglist[i]) is float:
-                    
-                    idx = int(arglist[i])               
-                    sign = listout[idx][0:1]
-                    tmp = listout[idx].lstrip('-+')
-                
-                    if tmp.find('.') >= 0 and tmp.replace('.','').isdigit() is True and (len(tmp) - len(tmp.replace('.',''))) == 1:
-                        repl = float(tmp)
-                    elif tmp.isdigit() is True:
-                        repl = int(tmp)
-                    else:
-                        repl = ''
-                    
-                    if type(repl) is not str:
-                        if sign == '-': repl = (repl * -1)
-                        listout[idx] = repl                
-
+                                                     
+            for arg in self.args:
+                                                     
+                if type(arg) is float: 
+                                                     
+                    i = int(arg)
+                    x = listout[i]
+                    negative = True if x[0:1] == '-' else False
+                    x = x.lstrip('-+')
+                                                     
+                    y = (float(x) if x.find('.') >= 0 
+                                 and x.replace('.','').isdigit() is True 
+                                 and (len(x) - len(x.replace('.',''))) == 1 
+                    else int(x)   if x.isdigit() is True
+                    else '')
+                                                     
+                    if type(y) is not str:
+                        listout[i] = y if not negative else y*-1
+                        
             yield listout
 
 
@@ -291,38 +287,40 @@ class DistinctList(beam.PTransform):
 
 #######################################################################################################
 # GenerateSKs - Given an integer starting key arg, this will iterate through a PCollection,
-#                 incrementing the new SK value by one each time and prepending the SK to the start of
-#                 each PCollection 'record'
-#             - Could easily be amended to increment to a specified interval
+#                 incrementing the new SK value by the interval value each time and prepending the SK 
+#                 to the start of each PCollection 'record'
 #######################################################################################################  
 
 class GenerateSKs(beam.PTransform):
     
-    def __init__(self, start_sk):
+    def __init__(self, start_sk, interval=1):
         self.start_sk = start_sk
+        self.interval = interval                                           
     
     def expand(self, pcoll):
       
         return (
             pcoll | 'Combine Lists'      >> beam.combiners.ToList()
-                  | 'Add Keys '          >> beam.ParDo(self.PrependSKs(self.start_sk))
+                  | 'Add Keys '          >> beam.ParDo(self.PrependSKs(self.start_sk,self.interval))
                   | 'Normalise Lists'    >> beam.FlatMap(normalise_list_of_lists)
                )
  
     class PrependSKs(beam.DoFn):
     
-        def __init__(self, start_sk):
+        def __init__(self, start_sk, interval):
             self.start_sk = start_sk
+            self.interval = interval           
         
         def process(self, listin):
     
             sk = self.start_sk
+            interval = self.interval
             listout = []
         
             for rec in listin:
                 new_rec = [str(sk)] + rec
                 listout.append(new_rec)
-                sk = sk + 1
+                sk = sk + interval
 
             yield listout
 
@@ -367,11 +365,12 @@ def apply_fk(listin, lookup, args):
         key = key + '\t' + str(listout[arglist[i]])
    
     arglist.sort(reverse=True)
-    for i in range(len(arglist)):
-        listout.pop(arglist[i])       
-        
-    if len(key) == 0: listout = listout + [key]
-    else: listout = listout + [lookup.get(key,'')]
+    for i in arglist: listout.pop(i)
+                                                      
+    if len(key) == 0: 
+        listout = listout + [key]
+    else: 
+        listout = listout + [lookup.get(key,'')]
             
     yield listout
 
@@ -398,6 +397,7 @@ def append_lookup_val(listin, lookup, args):
     arglist = list(args)
     listout = deepcopy(listin)
     key = listout[arglist[0]]
+                                                     
     for i in range(1,len(arglist)):
         key = key + '\t' + str(listout[arglist[i]])
         
@@ -491,8 +491,8 @@ class CreateCountLookup(beam.PTransform):
             yield "\t".join([str(x) for x in rec[0:self.split_pos]]) + '|' + "\t".join([str(x) for x in rec[self.split_pos:]])     
 
 #######################################################################################################
-# SplitAttributes - The first argument must be the delimier character you wish to split on            
-#                 - Subsequent arguments should be numeric postionas of fields to split
+# SplitAttributes - The first argument must be the delimiter character you wish to split on            
+#                 - Subsequent arguments should be numeric postions of fields to split
 #                 - Fields will be split in situ, i.e. fields following those that are split may be
 #                     pushed further out   
 #######################################################################################################
@@ -518,12 +518,11 @@ class SplitAttributes(beam.PTransform):
             arglist = list(self.args)
             arglist.sort(reverse=True)
             listout = deepcopy(listin)
- 
-            for i in range(len(arglist)):
-                parts = listout[arglist[i]].split(self.split_char)
-                listout.pop(arglist[i])
-                for p in reversed(range(len(parts))):
-                    listout.insert(arglist[i], parts[p].strip())
+                                                     
+            for i in arglist:
+                parts = listout[i].split(self.split_char)
+                listout.pop(i)
+                for p in reversed(parts): listout.insert(i,p.strip())    
  
             yield listout
             
@@ -561,6 +560,7 @@ class Normalise(beam.PTransform):
             
             blanks = self.kwargs.get('blanks','y').lower()
             commonlist = []
+                                                     
             for i in range(len(listin)):
                 if i not in self.args:
                     commonlist.append(listin[i])
@@ -568,13 +568,13 @@ class Normalise(beam.PTransform):
             limit = len(self.args) // self.outputs
             counter = limit + 1
             
-            for i in range(len(self.args)):
+            for i in self.args:
                 
                 if counter > limit:
                     templist = []
                     counter = 1
                     
-                templist = templist + [listin[self.args[i]]]
+                templist = templist + [listin[i]]
                 counter = counter + 1
                 
                 if counter > limit:
