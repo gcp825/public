@@ -22,6 +22,7 @@
 ########################################################################################################
 
 from copy import deepcopy
+from hashlib import blake2b as b2b
 import apache_beam as beam
 import csv
 import operator
@@ -218,12 +219,19 @@ class Sort(beam.PTransform):
         self.kwargs = kwargs
     
     def expand(self, pcoll):
+        
+        def _normalise_list_of_lists(listin):
+    
+            for rec in listin:
+                output = "|".join([str(x) for x in rec])
+                yield output.split('|')
+            
       
         return (
             pcoll | 'Parse Numerics'     >> beam.ParDo(self.ParseNumbers(*self.args))
                   | 'Combine Lists'      >> beam.combiners.ToList()
                   | 'Sort List'          >> beam.ParDo(self.SortList(*self.args2,**self.kwargs))
-                  | 'Normalise Lists'    >> beam.FlatMap(normalise_list_of_lists)
+                  | 'Normalise Lists'    >> beam.FlatMap(_normalise_list_of_lists)
                )
 
     class ParseNumbers(beam.DoFn):
@@ -272,7 +280,7 @@ class Sort(beam.PTransform):
 #######################################################################################################
 # DistinctList - Implementation of beam.transforms.util.Distinct() for Python List PCollections
 #
-#  ** Probably a more eficient way to do this in a single function & keeping as a list throughout
+#  ** Probably a more efficient way to do this in a single function & keeping as a list throughout
 #######################################################################################################             
              
 class DistinctList(beam.PTransform):
@@ -286,6 +294,288 @@ class DistinctList(beam.PTransform):
                )
 
 #######################################################################################################
+# Join - joins the primary PCollection in a pipeline to another PCollection (as a side input)
+#
+#    - Specify arguments as follows:
+#
+#      Arg 0 - the side input PCollection to join the main PCollection to
+#      Arg 1 - the type of join to perform (modelled on standard SQL logic)... supply either:
+#                'Inner', 'Left', 'Cross', 'Exists' ,'Not_Exists'
+#
+#              - 'Inner', 'Left', 'Cross' will return the attributes from both PCollections as a list
+#              - 'Exists', 'Not_Exists' will return just those records from the main PCollection that
+#                   exist/do not exist on the side input PCollection (as appropriate)
+#
+#    - Specify keyword arguments as follows:
+#
+#      main_key - a comma delimited text string specifying the list indexes of the items in the main
+#                 PCollection that are to be used as join criteria
+#      side_key - a comma delimited text string specifying the list indexes of the items in the side
+#                 PCollection that are to be used as join criteria. These will be positionally matched
+#                 to the arguments supplied in main_key i.e
+#
+#                 main_key = '1,2', side_key='3,0' would join main[1] to side[3] & main[2] to side[0]
+#
+#      key      - a comma delimited text string specifying the list indexes of the items in both the
+#                 main and side PCollections that are to be used as join criteria. i.e. 'key' can be
+#                 supplied INSTEAD of main_key and side_key if both PCollections share the same format
+#                 (or different formats but with the join fields in the same positions)
+#
+#      keep     - an optional argument that if supplied should contain a comma delimited text string
+#                 containing the list indexes of items in the result PCollection that should be
+#                 retained. Invokes the beam_tools.KeepFields transform. Only used by Inner/Left/Cross
+#                 modes
+#
+#######################################################################################################
+
+class Join(beam.PTransform):
+    
+    def __init__(self, side_input, join, **kwargs):
+        
+        self.side_input = side_input
+        self.join = join[0:1].upper()
+        self.keep = [] if str(kwargs.get('keep','')) == '' else [int(x) for x in list(str(kwargs.get('keep')).split(','))]
+        
+        if str(kwargs.get('main_key','x')) != 'x': key = 'main_key'
+        elif str(kwargs.get('key','x')) != 'x': key = 'key'
+        else: key = 'side_key'
+        
+        self.main_key = [int(x) for x in str(kwargs.get(key,0)).split(',')]
+
+        if str(kwargs.get('side_key','x')) != 'x': key = 'side_key'
+        elif str(kwargs.get('key','x')) != 'x': key = 'key'
+        else: key = 'main_key'
+        
+        self.side_key = [int(x) for x in str(kwargs.get(key,0)).split(',')]
+        
+     
+    def expand(self, pcoll):
+
+        def _join_key(listin,args):
+            
+            join_str = '~'.join([str(listin[i]) for i in args])
+            join_key = join_str if len(join_str) <= 32 else b2b(join_str.encode('utf-8'),digest_size=16).hexdigest()
+            return join_key
+
+        def _prepare(side_input): return (_join_key(side_input,self.side_key),side_input)
+               
+        def _cross(main,side_input):
+            
+            for rec in side_input:
+                yield deepcopy(main + rec)
+                
+        def _inner(main,side_input):
+            
+            main_join_key = _join_key(main,self.main_key)
+            
+            for rec in side_input:
+                if main_join_key == rec[0]:
+                    yield deepcopy(main + rec[1])
+                    
+        def _exists(main,side_input):
+            
+            main_join_key = _join_key(main,self.main_key)
+            
+            for rec in side_input:
+                if main_join_key == rec[0]:
+                    yield deepcopy(main)
+                    break
+                                    
+        def _left(main,side_input):
+ 
+            main_join_key = _join_key(main,self.main_key)
+            no_match = []
+            joined = False
+             
+            for rec in side_input:
+                no_match = len(rec[1]) * ['']
+                break
+            
+            for rec in side_input:
+
+                if main_join_key == rec[0]:
+                    joined = True
+                    yield deepcopy(main + rec[1])
+                    
+            if not joined: yield deepcopy(main + no_match)
+            
+        def _not_exists(main,side_input):
+ 
+            main_join_key = _join_key(main,self.main_key)
+            joined = False
+            
+            for rec in side_input:
+                if main_join_key == rec[0]:
+                    joined = True
+                    break
+                
+            if not joined: yield deepcopy(main)
+            
+#       Pipeline:
+
+        side = (self.side_input | 'Prepare' >> beam.Map(_prepare)) if self.join in 'LINE' else self.side_input
+            
+        reformat = False if len(self.keep) == 0 or self.join in 'EN' else True
+        
+        join_func = (_inner      if self.join == 'I' else
+                     _left       if self.join == 'L' else
+                     _exists     if self.join == 'E' else
+                     _not_exists if self.join == 'N' else
+                     _cross)
+                    
+        if reformat:
+            return (pcoll | 'Join' >> beam.FlatMap(join_func, beam.pvalue.AsIter(side))
+                          | 'Keep' >> KeepFields(*self.keep))
+        else:
+            return (pcoll | 'Join' >> beam.FlatMap(join_func, beam.pvalue.AsIter(side)))
+
+#######################################################################################################
+# Lookup - joins the primary PCollection in a pipeline to another PCollection (as a side input)
+#        - specifically for use where the join key value on the side input is unique (as would
+#          normally be the case in a lookup) as this allows the side input to be processed as a
+#          Dictionary... which is a far quicker method of joining than having to iterate through the
+#          entire side input
+#
+#    - Specify arguments as follows:
+#
+#      Arg 0 - the side input PCollection to join the main PCollection to
+#      Arg 1 - the type of join to perform (modelled on standard SQL logic)... supply either:
+#                'Inner', 'Left', 'Exists' ,'Not_Exists'
+#
+#              - 'Inner', 'Left' will return the attributes from both PCollections as a list
+#              - 'Exists', 'Not_Exists' will return just those records from the main PCollection that
+#                   exist/do not exist on the side input PCollection (as appropriate)
+#
+#                Note there is no Cross join option when using Lookup - use Join for this
+#
+#    - Specify keyword arguments as follows:
+#
+#      side_val - a comma delimited text string specifying the list indexes of the items in the side
+#                 input that are to be returned in the event of a successful join
+#      main_key - a comma delimited text string specifying the list indexes of the items in the main
+#                 PCollection that are to be used as join criteria
+#      side_key - a comma delimited text string specifying the list indexes of the items in the side
+#                 PCollection that are to be used as join criteria. These will be positionally matched
+#                 to the arguments supplied in main_key i.e
+#
+#                 main_key = '1,2', side_key='3,0' would join main[1] to side[3] & main[2] to side[0]
+#
+#      key      - a comma delimited text string specifying the list indexes of the items in both the
+#                 main and side PCollections that are to be used as join criteria. i.e. 'key' can be
+#                 supplied INSTEAD of main_key and side_key if both PCollections share the same format
+#                 (or different formats but with the join fields in the same positions)
+#
+#      keep     - an optional argument that if supplied should contain a comma delimited text string
+#                 containing the list indexes of items in the result PCollection that should be
+#                 retained. Invokes the beam_tools.KeepFields transform. Only used by Inner/Left modes.
+#
+#######################################################################################################
+
+class Lookup(beam.PTransform):
+    
+    def __init__(self, side_input, join, **kwargs):
+        
+        self.side_input = side_input
+        self.join = join[0:1].upper()
+        self.keep = [] if str(kwargs.get('keep','')) == '' else [int(x) for x in list(str(kwargs.get('keep')).split(','))]
+        
+        if str(kwargs.get('main_key','x')) != 'x': key = 'main_key'
+        elif str(kwargs.get('key','x')) != 'x': key = 'key'
+        else: key = 'side_key'
+        
+        self.main_key = [int(x) for x in str(kwargs.get(key,0)).split(',')]
+
+        if str(kwargs.get('side_key','x')) != 'x': key = 'side_key'
+        elif str(kwargs.get('key','x')) != 'x': key = 'key'
+        else: key = 'main_key'
+        
+        self.side_key = [int(x) for x in str(kwargs.get(key,0)).split(',')]
+        
+        self.side_val = [] if str(kwargs.get('side_val','')) == '' else [int(x) for x in list(str(kwargs.get('side_val')).split(','))]
+        
+        self.no_match = len(self.side_val) * ['']
+        
+        
+    def expand(self, pcoll):
+
+        def _key(listin,args):
+            
+            join_str = '~'.join([str(listin[i]) for i in args])
+            join_key = join_str if len(join_str) <= 32 else b2b(join_str.encode('utf-8'),digest_size=16).hexdigest()
+            return join_key
+        
+        def _prepare(listin):        
+  
+            listout = []
+            val = []
+            
+            key = _key(listin,self.side_key)
+            for i in self.side_val: val = val + [str(listin[i])]
+            
+            listout = listout + [key] + val
+            return listout
+        
+        def _convert(listin):
+            
+            key = deepcopy(listin[0])
+            val = deepcopy(listin)
+            val.pop(0)
+            return (key,val)
+        
+        def _inner(main,side_input):
+ 
+            main_join_key = _key(main,self.main_key)            
+            sidelist = side_input.get(main_join_key,'x')
+            
+            if type(sidelist) is list:
+                listout = [] + deepcopy(main) + deepcopy(sidelist)
+                yield listout
+                
+        def _exists(main,side_input):
+ 
+            main_join_key = _key(main,self.main_key)
+            sidelist = side_input.get(main_join_key,'x')
+            
+            if type(sidelist) is list:
+                yield deepcopy(main)
+
+        def _left(main,side_input):
+ 
+            main_join_key = _key(main,self.main_key)            
+            sidelist = side_input.get(main_join_key,self.no_match)
+            
+            listout = [] + deepcopy(main) + deepcopy(sidelist)
+            yield listout
+            
+        def _not_exists(main,side_input):
+ 
+            main_join_key = _key(main,self.main_key)            
+            sidelist = side_input.get(main_join_key,'x')
+            
+            if type(sidelist) is str:
+                yield deepcopy(main)
+      
+#       Pipeline:
+
+        side = (self.side_input | 'Prepare'  >> beam.Map(_prepare)
+                                | 'Distinct' >> DistinctList()
+                                | 'Convert'  >> beam.Map(_convert))
+        
+        reformat = False if len(self.keep) == 0 or self.join in 'EN' else True
+        
+        join_func = (_inner      if self.join == 'I' else
+                     _exists     if self.join == 'E' else
+                     _not_exists if self.join == 'N' else
+                     _left)
+                    
+        if reformat:
+            return (pcoll | 'Join' >> beam.FlatMap(join_func, beam.pvalue.AsDict(side))
+                          | 'Keep' >> KeepFields(*self.keep))
+        else:
+            return (pcoll | 'Join' >> beam.FlatMap(join_func, beam.pvalue.AsDict(side)))
+        
+            
+#######################################################################################################
 # GenerateSKs - Given an integer starting key arg, this will iterate through a PCollection,
 #                 incrementing the new SK value by the interval value each time and prepending the SK 
 #                 to the start of each PCollection 'record'
@@ -293,178 +583,43 @@ class DistinctList(beam.PTransform):
 
 class GenerateSKs(beam.PTransform):
     
-    def __init__(self, start_sk, interval=1):
+    def __init__(self, start_sk=1, interval=1):
         self.start_sk = start_sk
         self.interval = interval                                           
     
     def expand(self, pcoll):
-      
-        return (
-            pcoll | 'Combine Lists'      >> beam.combiners.ToList()
-                  | 'Add Keys '          >> beam.ParDo(self.PrependSKs(self.start_sk,self.interval))
-                  | 'Normalise Lists'    >> beam.FlatMap(normalise_list_of_lists)
-               )
- 
+        
+        return (pcoll | 'Add Keys ' >> beam.ParDo(self.PrependSKs(self.start_sk,self.interval)))
+
     class PrependSKs(beam.DoFn):
     
         def __init__(self, start_sk, interval):
-            self.start_sk = start_sk
-            self.interval = interval           
+            self.next_sk = start_sk
+            self.interval = interval
         
         def process(self, listin):
     
-            sk = self.start_sk
-            interval = self.interval
-            listout = []
-        
-            for rec in listin:
-                new_rec = [str(sk)] + rec
-                listout.append(new_rec)
-                sk = sk + interval
-
-            yield listout
+            sk = [] + [str(self.next_sk)]
+            yield sk + deepcopy(listin)
+            self.next_sk = self.next_sk + self.interval
 
 #######################################################################################################
-# ApplyFKs - Append a foreign key value to the end of a PCollection 'record' and drop the associated  
-#            natural key value(s) from the PCollection
+# Count - the direct equivalent of the sql count/group by function - when supplied with list indexes of
+#         items in the input PCollection, this will determine the distinct value combinations of the
+#         data represented by those indexes and tally the number of records with those values
 #
-#          - First argument is a PCollection of tuples containing a key/value lookup pairs
-#              - the key should be the 'natural' key i.e. the data field(s) you want to replace with
-#                a foreign key reference
-#              - the value should be the foreign key you want to replace the natural fields with
-#          - Subsequent arguments should be numeric position operators identifying the field(s) in
-#              the input PCollection to be used to join to the Lookup Key
+#         i.e (PColl | 'Count' >> beam_tools.Count(0,1))
 #
-#          If a foreign key relates to a compound natural key of multiple fields, all of these fields
-#            should be specified as arguments. The contents of these fields will be concatenated in the
-#            order specified, with a tab between each field. The key value in the lookup will have to
-#            be similarly prepared (you can use the CreateLookup class to do this).
+#             is the direct equivalent of:
 #
-#  ** Could easily be amended to insert the FK in a specific position
-#  ** Uses SideInputs joining AsDict with FlatMap. This works well for smaller lookups, but
-#       is there a better way to do this, particularly for larger datasets?
-#######################################################################################################
-
-class ApplyFKs(beam.PTransform):
-    
-    def __init__(self, lookup, *args):
-        self.lookup = lookup
-        self.args = args
-    
-    def expand(self, pcoll):
-      
-        return (pcoll | 'Apply FK' >> beam.FlatMap(apply_fk, beam.pvalue.AsDict(self.lookup), self.args))
-
-def apply_fk(listin, lookup, args):
-
-    arglist = list(args)
-    listout = deepcopy(listin)
-    key = listout[arglist[0]]
-    
-    for i in range(1,len(arglist)):
-        key = key + '\t' + str(listout[arglist[i]])
-   
-    arglist.sort(reverse=True)
-    for i in arglist: listout.pop(i)
-                                                      
-    if len(key) == 0: 
-        listout = listout + [key]
-    else: 
-        listout = listout + [lookup.get(key,'')]
-            
-    yield listout
-
-#######################################################################################################
-# AppendLookupVals - as per ApplyFKs except:
-#     - Fields in the input PCollection that match to the lookup key are not removed from the output
-#     - Multiple fields (tab separated) in the lookup value are split into individual output fields
+#             SELECT Column_0, Column_1, Count(*) FROM PColl GROUP BY Column_0, Column_1
 #
-#  ** Actually, looks like I've forgotten to code that multiple tab separated fields thing!
-#######################################################################################################
-
-class AppendLookupVals(beam.PTransform):
-    
-    def __init__(self, lookup, *args):
-        self.lookup = lookup
-        self.args = args
-    
-    def expand(self, pcoll):
-      
-        return (pcoll | 'Apply Lookup Val' >> beam.FlatMap(append_lookup_val, beam.pvalue.AsDict(self.lookup), self.args))
-
-def append_lookup_val(listin, lookup, args):
-
-    arglist = list(args)
-    listout = deepcopy(listin)
-    key = listout[arglist[0]]
-                                                     
-    for i in range(1,len(arglist)):
-        key = key + '\t' + str(listout[arglist[i]])
-        
-    if key in lookup:
-        listout = listout + [lookup[key]]   
-        yield listout
-
-#######################################################################################################
-# CreateLookup - Takes a PCollection and converts to a distinct set of tuple key/value pairs to be
-#                used as a side input to the ApplyFKs or AppendLookupVals transform
-#
-#          - First argument is the 'split position' - the position in which the subsequent positional
-#            arguments should be sliced to define which fields should form the key and which the value
-#
-#          - Subsequent arguments should be numeric position operators identifying the field(s) to
-#            form the lookup in key, then value order.
-#
-#          - Multiple fields on the key or value side (as defined by the 'split position' (as it
-#            relates to the number of subsequent arguments)) will be concatenated together,
-#            delimited by tabs. e.g.
-#
-#            1,0,1      creates a key/value lookup of field0 -- field1
-#            1,0,1,2    creates a key/value lookup of field0 -- field1 + tab + field2
-#            2,3,2,0,1  creates a key/value lookup of field3  + tab + field2 -- field0 + tab + field1
-#
-# ** Can probably use DistinctLists instead and remove the string conversion
+# ** Could be expanded with a filter option as the equivalent of HAVING COUNT(*)...
+# ** Possible to add COUNT(DISTINCT(column)) functionality?
 #
 #######################################################################################################
 
-class CreateLookup(beam.PTransform):
-    
-    def __init__(self, split_pos, *args):
-        self.split_pos = split_pos
-        self.args = args
-    
-    def expand(self, pcoll):
-      
-        return (
-            pcoll | 'Reformat'           >> beam.ParDo(KeepFields.Keep(*self.args))
-                  | 'Convert to Rec'     >> beam.ToString.Iterables(delimiter='|')
-                  | 'Distinct'           >> beam.transforms.util.Distinct()
-                  | 'Prep KeyVal Pair'   >> beam.ParDo(self.SplitAndConcat(self.split_pos))
-                  | 'Convert to Tuple'   >> beam.ParDo(ConvertRecTo(tuple,'|'))
-               )
- 
-    class SplitAndConcat(beam.DoFn):
-    
-        def __init__(self, split_pos):
-            self.split_pos = split_pos
-        
-        def process(self, linein):
-    
-            rec = linein.split('|')
-            yield "\t".join([str(x) for x in rec[0:self.split_pos]]) + '|' + "\t".join([str(x) for x in rec[self.split_pos:]])
- 
-#######################################################################################################
-# CreateCountLookup - As per CreateLookup, except that here the specified arguments are the field(s)
-#                     to form the key part of the key/value pair only.
-#
-#                     The value part of the key/value pair is calculated as the number of 'records'
-#                     in the pcollection with that key or keys i.e. it's a COUNT(*)/GROUP BY
-#
-# ** Can probably remove the string conversion if Count works with Lists
-#
-#######################################################################################################
-
-class CreateCountLookup(beam.PTransform):
+class Count(beam.PTransform):
     
     def __init__(self, *args):
         self.args = args
@@ -472,24 +627,12 @@ class CreateCountLookup(beam.PTransform):
     def expand(self, pcoll):
       
         return (
-            pcoll | 'Reformat'           >> beam.ParDo(KeepFields.Keep(*self.args))
-                  | 'Convert to Rec #1'  >> beam.ToString.Iterables(delimiter='|')
+            pcoll | 'Reformat'           >> KeepFields(*self.args)
+                  | 'Convert to Str'     >> beam.ToString.Iterables(delimiter='|')
                   | 'Count'              >> beam.combiners.Count.PerElement()
-                  | 'Convert to Rec #2'  >> beam.ToString.Kvs(delimiter = '|')
-                  | 'Prep KeyVal Pair'   >> beam.ParDo(self.SplitAndConcat(len(self.args)))
-                  | 'Convert to Tuple'   >> beam.ParDo(ConvertRecTo(tuple,'|'))
+                  | 'Convert to List'    >> beam.Map(lambda x: x[0].split('|') + [str(x[1])])
                )
  
-    class SplitAndConcat(beam.DoFn):
-    
-        def __init__(self, split_pos):
-            self.split_pos = split_pos
-        
-        def process(self, linein):
-    
-            rec = linein.split('|')
-            yield "\t".join([str(x) for x in rec[0:self.split_pos]]) + '|' + "\t".join([str(x) for x in rec[self.split_pos:]])     
-
 #######################################################################################################
 # SplitAttributes - The first argument must be the delimiter character you wish to split on            
 #                 - Subsequent arguments should be numeric postions of fields to split
@@ -581,6 +724,27 @@ class Normalise(beam.PTransform):
                     if blanks != 'n' or len(''.join([str(x) for x in templist])) > 0:
                         listout = [] + commonlist + templist
                         yield listout
+                        
+#######################################################################################################
+# First - Limits the PCollection to the first n records specified (supplied as the only arg)
+#######################################################################################################
+            
+class First(beam.PTransform):
+    
+    def __init__(self, limit):
+        self.num_of_recs = 1
+        self.limit = limit
+    
+    def expand(self, pcoll):
+        
+        def _first(listin):
+       
+            if self.num_of_recs <= self.limit:
+                self.num_of_recs = self.num_of_recs + 1
+                yield deepcopy(listin)
+        
+        return (pcoll | 'Filter' >> beam.FlatMap(_first))
+
 
 #######################################################################################################
 # SwitchDelimiters - Supply two args: old delimiter and new delimiter
@@ -642,14 +806,4 @@ class Copy(beam.DoFn):
         if self.copies > 3:
             yield beam.pvalue.TaggedOutput(self.x4, datain)
         if self.copies > 4:
-            yield beam.pvalue.TaggedOutput(self.x5, datain)           
-        
-#######################################################################################################
-# normalise_list_of_lists - takes a list of lists and normalises to a PCollection record per inner list
-#######################################################################################################
-
-def normalise_list_of_lists(listin):
-    
-    for rec in listin:
-        output = "|".join([str(x) for x in rec])
-        yield output.split('|')
+            yield beam.pvalue.TaggedOutput(self.x5, datain)          

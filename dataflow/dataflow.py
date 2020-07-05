@@ -55,27 +55,23 @@ def run(cloud=False):
     
     with ab.Pipeline(options=opt) as pipe02:
         
-        pc01 = (pipe02 | 'Read Lookup'       >> io.ReadFromText(path + 'lookup.dat', skip_header_lines=0)
-                       | 'Lookup ToList'     >> ab.ParDo(bt.ConvertRecTo(list,'|'))
-                       | 'Lookup Tuple'      >> bt.CreateLookup(1,0,1))
+        pc01 = (pipe02 | 'Read Lookup'       >> io.ReadFromText(write_path + 'lookup.dat', skip_header_lines=0)
+                       | 'Lookup ToList'     >> ab.ParDo(bt.ConvertRecTo(list,'|')))
 
-        pc02 = (pipe02 | 'Read People'       >> io.ReadFromText(path + 'people.dat', skip_header_lines=0)
+        pc02 = (pipe02 | 'Read People'       >> io.ReadFromText(write_path + 'people.dat', skip_header_lines=0)
                        | 'People ToList'     >> ab.ParDo(bt.ConvertRecTo(list,'|'))
                        | 'Normalise'         >> bt.Normalise(2,0,1,2,3,4,5,blanks='n')
                        | 'Transform'         >> bt.XForm(t0=str.title,t1=get_initial,t2=str.upper)
-                       | 'Lookup'            >> bt.AppendLookupVals(pc01,0)
-                       | 'Rearrange/Drop'    >> bt.KeepFields(1,2,3))
-        
-        pc03 = (pc02   | 'GroupBy Gender'    >> bt.CreateCountLookup(2)
-                       | 'Gender ToList'     >> ab.Map(list)
+                       | 'Join'              >> bt.Join(pc01,'Left',key=0,keep='1,2,4'))    
+         
+        pc03 = (pc02   | 'GroupBy Gender'    >> bt.Count(2)
                        | 'Sort Gender'       >> bt.Sort(1.,0)
                        | 'Format Gender'     >> ts.Iterables(delimiter=': ')
                        | 'Write Gender'      >> io.WriteToText(write_path + 'gender.txt',shard_name_template=''))
  
-        pc04 = (pc02   | 'GroupBy Name'      >> bt.CreateCountLookup(1,0)
-                       | 'Name ToList'       >> ab.Map(list)
+        pc04 = (pc02   | 'GroupBy Name'      >> bt.Count(1,0)
                        | 'Sort Name'         >> bt.Sort(0,1.)
-                       | 'Format Name'       >> ts.Iterables(delimiter=': ')
+                       | 'Format Name'       >> ab.Map(lambda x: x[0] + ' ' + x[1] + ': ' + x[2])
                        | 'Write Name'        >> io.WriteToText(write_path + 'names.txt',shard_name_template=''))
         
 if __name__ == '__main__': run()
